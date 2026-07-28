@@ -116,7 +116,8 @@ isolated function resolveWorkflowApiKey(string? keyId) returns string? {
 
 // Fetches workflow definitions live from the runtime's GET /workflow/definitions API for the
 // given component+environment and maps them to the Workflow artifact shape used by the frontend.
-// Returns [] when no running runtime advertises a workflow callback URL. Used by the GraphQL
+// Returns [] when no running runtime advertises a workflow callback URL, or when the runtime's
+// workflow management API is not reachable (see below). Used by the GraphQL
 // `workflowsByEnvironmentAndComponent` resolver (definitions are no longer carried in heartbeats).
 isolated function fetchWorkflowDefinitions(string componentId, string environmentId) returns types:Workflow[]|error {
     types:WorkflowTarget?|error target = storage:getRuntimeWorkflowTarget(componentId, environmentId);
@@ -133,7 +134,17 @@ isolated function fetchWorkflowDefinitions(string componentId, string environmen
         headers["X-API-Key"] = apiKey;
     }
     http:Client wfClient = check getWorkflowClient(target.callbackUrl);
-    http:Response resp = check wfClient->get("/workflow/definitions", headers);
+    // The runtime now always reports a callbackUrl, so its presence no longer indicates that workflow
+    // management is enabled — reachability does. The management API listener only runs when the runtime
+    // sets `[ballerina.workflow.management] enableManagementApi = true`; otherwise this call fails at the
+    // connection level. Treat that as "no workflows" so the feature is hidden gracefully rather than
+    // surfacing an error. (A reachable-but-erroring API still returns a non-200 error below.)
+    http:Response|error resp = wfClient->get("/workflow/definitions", headers);
+    if resp is error {
+        log:printDebug("Workflow management API not reachable; treating component as having no workflows",
+                componentId = componentId, environmentId = environmentId, callbackUrl = target.callbackUrl, 'error = resp);
+        return [];
+    }
     if resp.statusCode != 200 {
         // Keep the upstream payload out of the client-facing error; log it for diagnosis.
         json|error errBody = resp.getJsonPayload();
@@ -266,15 +277,20 @@ function proxyWorkflowRequest(string componentId, string environmentId, string[]
         req.setHeader("X-API-Key", apiKey);
     }
 
-    // 6. Forward (method + body preserved) and relay the upstream response.
+    // 6. Forward (method + body preserved) and relay the upstream response. A connection-level
+    //    failure means the runtime's workflow management API isn't running (it starts only when the
+    //    runtime sets `[ballerina.workflow.management] enableManagementApi = true`). The runtime now
+    //    always reports a callbackUrl, so reachability — not its presence — tells us the feature is on.
+    //    Surface that as 503 (same as "no workflow runtime"), which the frontend treats as the feature
+    //    being unavailable, rather than 502 which reads as an upstream fault.
     http:Client|error wfClient = getWorkflowClient(target.callbackUrl);
     if wfClient is error {
-        return workflowErrorResponse(502, "Failed to connect to workflow runtime: " + wfClient.message());
+        return workflowErrorResponse(503, "Workflow management is not available for this environment");
     }
     http:Response|error upstream = wfClient->forward(targetPath, req);
     if upstream is error {
-        log:printError("Workflow proxy forward failed", upstream, targetPath = targetPath);
-        return workflowErrorResponse(502, "Workflow runtime request failed: " + upstream.message());
+        log:printDebug("Workflow management API not reachable; forward failed", targetPath = targetPath, 'error = upstream);
+        return workflowErrorResponse(503, "Workflow management is not available for this environment");
     }
     return upstream;
 }
